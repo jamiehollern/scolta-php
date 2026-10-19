@@ -11,6 +11,7 @@ use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Middleware;
 use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Response;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Tag1\Scolta\Cache\CacheDriverInterface;
 use Tag1\Scolta\Index\LocalIndexLocator;
@@ -73,42 +74,83 @@ class IndexLocatorTest extends TestCase
     // Remote
     // -------------------------------------------------------------------
 
-    public function testRemoteFetchesTheEntryFileNotTheDirectory(): void
+    public function testRemoteFetchesTheScriptThenTheEntryFile(): void
     {
-        $locator = new RemoteIndexLocator('https://search.example.com/', $this->client(new Response(200)));
+        $locator = new RemoteIndexLocator('https://search.example.com/', $this->client(...$this->servedIndex()), new ArrayCache());
 
         $this->assertTrue($locator->exists());
         $this->assertTrue($locator->isRemote());
         $this->assertSame('https://search.example.com', $locator->origin());
         $this->assertSame(
-            'https://search.example.com/pagefind/pagefind-entry.json',
-            (string) $this->requests[0]['request']->getUri(),
+            ['https://search.example.com/pagefind/pagefind.js', 'https://search.example.com/pagefind/pagefind-entry.json'],
+            array_map(fn(array $entry) => (string) $entry['request']->getUri(), $this->requests),
         );
     }
 
-    public function testRemoteReportsANon200AsNoIndex(): void
+    public function testRemoteReportsAMissingScriptAsNoIndexWithoutAskingForTheEntryFile(): void
     {
-        $this->assertFalse((new RemoteIndexLocator('https://search.example.com', $this->client(new Response(404))))->exists());
+        $locator = new RemoteIndexLocator('https://search.example.com', $this->client(new Response(404)), new ArrayCache());
+
+        $this->assertFalse($locator->exists());
+        $this->assertCount(1, $this->requests);
+    }
+
+    public function testRemoteReportsAScriptServedAsHtmlAsNoIndex(): void
+    {
+        // An error page, or a login page a redirect landed on, answering 200.
+        $client = $this->client(new Response(200, ['Content-Type' => 'text/html; charset=UTF-8'], '<html>Sign in</html>'));
+
+        $this->assertFalse((new RemoteIndexLocator('https://search.example.com', $client, new ArrayCache()))->exists());
+    }
+
+    public function testRemoteReportsAMissingEntryFileAsNoIndex(): void
+    {
+        $client = $this->client($this->script(), new Response(404));
+
+        $this->assertFalse((new RemoteIndexLocator('https://search.example.com', $client, new ArrayCache()))->exists());
+    }
+
+    #[DataProvider('notAnEntryFile')]
+    public function testRemoteReportsAnEntryFileThatIsNotOneAsNoIndex(string $body): void
+    {
+        $client = $this->client($this->script(), new Response(200, ['Content-Type' => 'application/json'], $body));
+
+        $this->assertFalse((new RemoteIndexLocator('https://search.example.com', $client, new ArrayCache()))->exists());
+    }
+
+    /**
+     * Bodies a host can answer 200 with that are not an index's entry file.
+     *
+     * @return array<string, array{string}>
+     */
+    public static function notAnEntryFile(): array
+    {
+        return [
+            'an HTML error page' => ['<html><body>Not found</body></html>'],
+            'JSON without languages' => ['{"version":"1.4.0"}'],
+            'JSON without version' => ['{"languages":{"en":{}}}'],
+            'a JSON list' => ['[]'],
+        ];
     }
 
     public function testRemoteReportsAnUnreachableHostAsNoIndex(): void
     {
         $client = $this->client(new ConnectException('refused', new Request('GET', 'https://search.example.com')));
 
-        $this->assertFalse((new RemoteIndexLocator('https://search.example.com', $client))->exists());
+        $this->assertFalse((new RemoteIndexLocator('https://search.example.com', $client, new ArrayCache()))->exists());
     }
 
     public function testRemoteReusesACachedAnswerWithinTheTtl(): void
     {
         $cache = new ArrayCache();
-        $client = $this->client(new Response(200));
+        $client = $this->client(...$this->servedIndex());
 
         $first = new RemoteIndexLocator('https://search.example.com', $client, $cache);
         $second = new RemoteIndexLocator('https://search.example.com', $client, $cache);
 
         $this->assertTrue($first->exists());
         $this->assertTrue($second->exists());
-        $this->assertCount(1, $this->requests, 'A cached answer must not make a second request');
+        $this->assertCount(2, $this->requests, 'A cached answer must not make further requests');
         $this->assertSame([RemoteIndexLocator::DEFAULT_TTL], array_values($cache->ttls));
     }
 
@@ -128,10 +170,28 @@ class IndexLocatorTest extends TestCase
     public function testRemoteCachesEachOriginSeparately(): void
     {
         $cache = new ArrayCache();
-        $client = $this->client(new Response(200), new Response(404));
+        $client = $this->client(...[...$this->servedIndex(), new Response(404)]);
 
         $this->assertTrue((new RemoteIndexLocator('https://one.example.com', $client, $cache))->exists());
         $this->assertFalse((new RemoteIndexLocator('https://two.example.com', $client, $cache))->exists());
+    }
+
+    /**
+     * The two answers a host serving an index gives.
+     *
+     * @return list<Response>
+     */
+    private function servedIndex(): array
+    {
+        return [
+            $this->script(),
+            new Response(200, ['Content-Type' => 'application/json'], '{"version":"1.4.0","languages":{"en":{"hash":"en_1","wasm":"en","page_count":3}}}'),
+        ];
+    }
+
+    private function script(): Response
+    {
+        return new Response(200, ['Content-Type' => 'text/javascript'], 'export const init = () => {};');
     }
 
     private function client(Response|\Throwable ...$answers): Client
