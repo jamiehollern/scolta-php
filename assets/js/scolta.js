@@ -502,6 +502,14 @@
   // A browse loads only a capped, title-deduped head of the match list, so
   // allScoredResults.length there is an artifact of cap + dedup, not a total.
   let browseTotal = null;
+  // Raw Pagefind match ids behind the current keyword search — the union over
+  // every search that seeds the list (the typed query, the OR fallback terms,
+  // the expansion terms) — and whether any of those searches had more matches
+  // than MAX_PAGEFIND_RESULTS let it load. Null on a browse. Pagefind returns
+  // every match id before a single fragment loads, so the union is free; it
+  // is what the header reports as "of N" once the cap has truncated the list,
+  // since allScoredResults.length is then the cap, not a total.
+  let keywordMatches = null;
   let pagefindBase = '';   // Set during initPagefind(); used by resolveUrl().
   let currentSortOverride = null;    // { field, direction } or null — active sort override
   let llmAppliedFilters = {};        // { dimension: value } — filters injected by LLM expansion
@@ -3945,7 +3953,19 @@
     return loaded.map((data, i) => ({ data: data, score: toLoad - i }));
   }
 
-  async function searchAndLoadParallel(queries, filters, originalQuery, specificityOpts) {
+  // Record a seeding search's raw match ids into a keywordMatches tally (see
+  // the declaration). Every id is taken, not just the capped head that loads,
+  // and the tally remembers whether the cap cut anything.
+  function noteRawMatches(tally, search) {
+    if (!tally || !search || !search.results) return;
+    const CONFIG = getInstanceConfig();
+    if (search.results.length > CONFIG.MAX_PAGEFIND_RESULTS) tally.capped = true;
+    for (const r of search.results) tally.ids.add(r.id);
+  }
+
+  // `matchTally` is the keywordMatches object of the cycle this load belongs
+  // to, or null; each seeding term's raw match ids are recorded into it.
+  async function searchAndLoadParallel(queries, filters, originalQuery, specificityOpts, matchTally) {
     const CONFIG = getInstanceConfig();
     if (queries.length === 0) return [];
 
@@ -4016,6 +4036,7 @@
       if (!seedingTerms.has(queries[i].term)) continue;
       const search = searches[i];
       const { term, weight } = queries[i];
+      noteRawMatches(matchTally, search);
       const toLoad = Math.min(search.results.length, CONFIG.MAX_PAGEFIND_RESULTS);
       for (let j = 0; j < toLoad; j++) {
         const entry = search.results[j];
@@ -4339,6 +4360,10 @@
       debugLog('[scolta:expand] Discarding stale expansion (version', version, 'vs current', searchVersion, ')');
       return;
     }
+    // Taken now, while the version check above guarantees it is this cycle's:
+    // a newer doSearch() replaces keywordMatches, and the awaits below would
+    // otherwise let a stale expansion write into the cycle that superseded it.
+    const matchTally = keywordMatches;
 
     // An expansion term is a phrase, and decomposing it into words is what
     // puts a conjunction on the highlight list: "reading and writing" carries
@@ -4474,16 +4499,25 @@
         mergedFilters[dim] = vals;
       }
       if (hasFilterMatch) {
+        let activeChanged = false;
         for (const [dim, val] of Object.entries(subjectFilters)) {
           if (!mergedFilters[dim]) {
             mergedFilters[dim] = new Set([val]);
           }
           if (!activeFilters[dim]) {
             activeFilters[dim] = new Set([val]);
+            activeChanged = true;
           }
           if (!llmAppliedFilters[dim]) {
             llmAppliedFilters[dim] = val;
           }
+        }
+        // Same reason as the recall-guard path in doSearch(): the URL was
+        // written before this injection. The version guard above already
+        // established this expansion is current, and the sort path is never
+        // a browse (expansion is skipped for an empty query).
+        if (activeChanged && version === searchVersion) {
+          syncUrlToSearchState(originalQuery, originalQuery === '');
         }
       }
 
@@ -4567,6 +4601,10 @@
         // urlMap and out to the list. The typed query is counted by the typed
         // pass, so only the rest is the delta.
         countTerms = [...termSet].filter(t => t !== searchQuery);
+        // The union's raw ids are the header's "of N" once the cap bites. That
+        // overcounts documents the sort field filter drops, but only in the
+        // capped case, where the list length is no total either.
+        for (const search of searches) noteRawMatches(matchTally, search);
         withField.sort((a, b) => {
           const av = parseFloat(a.meta[field]);
           const bv = parseFloat(b.meta[field]);
@@ -4664,7 +4702,7 @@
       // the list.
       countTerms = queries.filter(q => !q.isTyped && !q.agreementOnly).map(q => q.term);
 
-      const expandedResults = await searchAndLoadParallel(queries, activeFilters, searchQuery, expandSpecificity);
+      const expandedResults = await searchAndLoadParallel(queries, activeFilters, searchQuery, expandSpecificity, matchTally);
 
       if (version !== searchVersion) {
         debugLog('[scolta:expand] Discarding stale expansion after load (version', version, 'vs current', searchVersion, ')');
@@ -4740,6 +4778,41 @@
     debugLog(`[scolta:expand] ${sortOverride ? 'Native sort' : 'Merged'}: ${allScoredResults.length} results`);
   }
 
+  // --- URL sync ---
+  //
+  // Writes the current query and activeFilters to the address bar as ?q= and
+  // f_<dim>= params. doSearch() calls it before the primary search; the two
+  // places that merge an LLM filter hint into activeFilters after that point
+  // call it again, so the URL carries the hint at the moment the "Filtered:"
+  // badge appears. A host that paints its own facet rail from the URL (the
+  // deferred facet mode leaves the bundle's checkbox markup empty) would
+  // otherwise show the hinted value unchecked until the next facet click
+  // re-entered doSearch().
+  function syncUrlToSearchState(query, isBrowse) {
+    try {
+      var url = new URL(window.location.href);
+      // A browse writes no q param rather than an empty one, so the link is
+      // the facet state alone and reloading it does not re-enter doSearch()
+      // through the bootstrap on a falsy query.
+      if (isBrowse) {
+        url.searchParams.delete('q');
+      } else {
+        url.searchParams.set('q', query);
+      }
+      for (const key of [...url.searchParams.keys()]) {
+        if (key.startsWith('f_')) url.searchParams.delete(key);
+      }
+      for (const [dim, vals] of Object.entries(activeFilters)) {
+        if (vals instanceof Set && vals.size > 0) {
+          url.searchParams.set('f_' + dim, [...vals].join(','));
+        }
+      }
+      history.replaceState(null, '', url.toString());
+    } catch (e) {
+      // Silently ignore — URL sync is non-critical.
+    }
+  }
+
   // --- Main search ---
 
   async function doSearch(preserveFilters, initialFilters) {
@@ -4800,6 +4873,7 @@
       allScoredResults = [];
       hadSpecificMatch = false;
       browseTotal = null;
+      keywordMatches = null;
       conversationMessages = [];
       followUpCount = 0;
       // Fresh cycle, fresh memo: identical searches are shared WITHIN a cycle
@@ -4823,28 +4897,7 @@
       }
 
       // Update URL with search query and active filter state.
-      try {
-        var url = new URL(window.location.href);
-        // A browse writes no q param rather than an empty one, so the link is
-        // the facet state alone and reloading it does not re-enter doSearch()
-        // through the bootstrap on a falsy query.
-        if (isBrowse) {
-          url.searchParams.delete('q');
-        } else {
-          url.searchParams.set('q', query);
-        }
-        for (const key of [...url.searchParams.keys()]) {
-          if (key.startsWith('f_')) url.searchParams.delete(key);
-        }
-        for (const [dim, vals] of Object.entries(activeFilters)) {
-          if (vals instanceof Set && vals.size > 0) {
-            url.searchParams.set('f_' + dim, [...vals].join(','));
-          }
-        }
-        history.replaceState(null, '', url.toString());
-      } catch (e) {
-        // Silently ignore — URL sync is non-critical.
-      }
+      syncUrlToSearchState(query, isBrowse);
 
       els.layout.style.display = "grid";
       emitBeforeResults('loading');
@@ -4906,6 +4959,13 @@
       // Pagefind returns every match id up front, so the true match total is
       // free here — before the cap decides how few of them to load.
       if (isBrowse) browseTotal = primarySearch.results.length;
+      // A keyword search tallies ids rather than a length, because the OR
+      // fallback and the expansion pass union further searches into it.
+      // Held in a local too: a newer cycle may replace keywordMatches during
+      // the loads below, and this cycle's later writes belong to its own tally.
+      const matchTally = isBrowse ? null : { ids: new Set(), capped: false };
+      keywordMatches = matchTally;
+      noteRawMatches(matchTally, primarySearch);
       allScoredResults = isBrowse
         ? await loadBrowseResults(primarySearch)
         : await loadAndScoreSearch(primarySearch, scorerQuery, 1.0);
@@ -4927,7 +4987,7 @@
           corpusTotal: subwordCorpusSize(activeFilters),
           strongMatched: false,
         };
-        const orResults = await searchAndLoadParallel(orQueries, activeFilters, searchQuery, orSpecificity);
+        const orResults = await searchAndLoadParallel(orQueries, activeFilters, searchQuery, orSpecificity, matchTally);
         // Only adopt the specificity signal if this search is still current — a
         // newer doSearch() resets hadSpecificMatch, and a late-resolving stale OR
         // fallback must not repollute it.
@@ -5081,6 +5141,10 @@
             }
             activeFilters[dim].add(val);
           }
+          // The hint changed activeFilters after doSearch() wrote the URL.
+          if (Object.keys(partition.applied).length > 0) {
+            syncUrlToSearchState(query, isBrowse);
+          }
         }
       }
       renderExpandedTerms(expandedTerms, query);
@@ -5115,8 +5179,17 @@
       // A browse skips summarization the way it skips expansion: there is no
       // query to summarize, and the endpoint 400s an empty one. The result
       // paint reserved no slot for a browse, so there is nothing to release.
+      // The summary is told only about the hints the recall guard applied
+      // (plus any the sort path injected): a declined hint is offered as a
+      // chip, not in force, and naming it here made the model describe a
+      // filter the user never saw. llmAppliedFilters survives a
+      // preserveFilters re-run (facet toggle, sort, load-more), so the
+      // summary keeps naming a hint that is still in force.
+      const summaryFilterHint = Object.keys(llmAppliedFilters).length > 0
+        ? { ...llmAppliedFilters }
+        : null;
       if (!isBrowse) {
-        summarizeResults(query, allScoredResults, expandedLabel, sortHint, filterHint, activeFilters)
+        summarizeResults(query, allScoredResults, expandedLabel, sortHint, summaryFilterHint, activeFilters)
           .catch(e => {
             if (version !== searchVersion) return;
             console.warn('[scolta:summarize] failed before the request:', e);
@@ -5249,10 +5322,12 @@
   //   scolta:before-results-render  { container, reason }
   //   scolta:results-rendered       { container, results, rendered, reused, appended, query }
   //   scolta:before-filters-render  { container }
-  //   scolta:filters-rendered       { container }
+  //   scolta:filters-rendered       { container, activeFilters }
   //
   // `container` is always the element being written and is identical to
-  // event.target. The events bubble, so one listener on the mount point or on
+  // event.target. `activeFilters` is { dimension: [value, ...] } — the
+  // selections in force at that paint, including a filter hint the LLM
+  // expansion applied, so a host rail need not parse the URL for them. The events bubble, so one listener on the mount point or on
   // document sees every render. They are deliberately NOT cancellable: a render
   // a consumer could veto would make every state assumption downstream
   // conditional, for a use case nobody has yet.
@@ -5298,8 +5373,22 @@
     emitLifecycle(els.filters, 'scolta:before-filters-render', { container: els.filters });
   }
 
+  // `activeFilters` is a plain object of string arrays, a snapshot of the
+  // state at this paint: a host that draws its own rail reads checked state
+  // from here instead of the URL's f_ params.
   function emitFiltersRendered() {
-    emitLifecycle(els.filters, 'scolta:filters-rendered', { container: els.filters });
+    emitLifecycle(els.filters, 'scolta:filters-rendered', {
+      container: els.filters,
+      activeFilters: activeFiltersSnapshot(),
+    });
+  }
+
+  function activeFiltersSnapshot() {
+    const out = {};
+    for (const [dim, vals] of Object.entries(activeFilters)) {
+      if (vals instanceof Set && vals.size > 0) out[dim] = [...vals];
+    }
+    return out;
   }
 
   // --- Filter handling ---
@@ -5688,9 +5777,21 @@
     // count while the paged list is deduped, so paging can exhaust before N —
     // preferred over reporting a cap artifact as the total. "Showing X" keeps
     // its meaning: how many are painted.
+    //
+    // A keyword search has the same problem once MAX_PAGEFIND_RESULTS cut
+    // the load: the list length is then the cap, so a facet that narrows the
+    // matches from 2,000 to 400 left N stuck at 75 even as the list changed.
+    // When the cap bit, N is the union of raw match ids across every search
+    // that seeded the list (filter-aware, since each search ran under the
+    // active filters). That figure counts fragments, and the list collapses
+    // fragments by URL and near-duplicate title, so it can run a little high
+    // — again accepted over a cap artifact. When nothing was cut, every
+    // match was loaded and the deduped list length IS the exact total, so it
+    // is kept: there the raw count would only overstate the dedup.
+    const capped = currentQuery && keywordMatches !== null && keywordMatches.capped;
     const totalCount = (!currentQuery && browseTotal !== null)
       ? browseTotal
-      : filtered.length;
+      : (capped ? Math.max(keywordMatches.ids.size, filtered.length) : filtered.length);
     const resultNoun = totalCount === 1 ? 'result' : 'results';
     // A browse has no query to name, and `results for ""` is worse than saying
     // nothing.

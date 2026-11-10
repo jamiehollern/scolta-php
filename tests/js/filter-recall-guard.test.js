@@ -144,6 +144,8 @@ describe('filter-hint recall guard', () => {
         expect(indicator.style.display).toBe('block');
         expect(indicator.innerHTML).toContain('Filter by topic: Branching');
         expect(indicator.innerHTML).not.toContain('Filtered: topic');
+        // An offered hint is not in activeFilters, so it is not in the URL.
+        expect(new win.URL(win.location.href).searchParams.get('f_topic')).toBeNull();
     });
 
     test('hint on a dimension absent from the index is dropped entirely (no chip)', async () => {
@@ -192,6 +194,112 @@ describe('filter-hint recall guard', () => {
         const indicator = win.document.querySelector('#scolta-filter-indicator');
         expect(indicator.innerHTML).toContain('Filtered: topic = Merging');
         expect(indicator.innerHTML).not.toContain('Filter by');
+
+        // The URL carries the applied hint as soon as the badge is up, so a
+        // host rail that reads checked state from f_ params agrees with it.
+        const url = new win.URL(win.location.href);
+        expect(url.searchParams.get('q')).toBe('merge conflict resolution');
+        expect(url.searchParams.get('f_topic')).toBe('Merging');
+    });
+
+    // The summary request carries a context whose header names the filters
+    // in force. Before the fix the raw expand-response hint was passed, so a
+    // declined hint still reached the model as "[Results are filtered by
+    // ...]" and the summary described a grade range no filter enforced
+    // (sharemylesson.com).
+    function summarizeContext(win) {
+        const call = win.fetch.mock.calls.find(([url]) => url === '/s');
+        expect(call).toBeDefined();
+        return JSON.parse(call[1].body).context;
+    }
+
+    test('declined hint is not described to the summary as a filter', async () => {
+        const docs = makeDocs([
+            [29, { topic: 'Basics' }],
+            [1, { topic: 'Branching' }],
+        ]);
+        const win = createGuardWindow(
+            { terms: ['git workflows', 'branching models'], filter_hint: { topic: 'Branching' } },
+            { topic: { Basics: 29, Branching: 1 } },
+            docs
+        );
+
+        await runSearch(win, 'most popular git workflows');
+
+        expect(win.__getFilterState().offeredLlmFilters).toEqual({ topic: 'Branching' });
+        const context = summarizeContext(win);
+        expect(context).not.toContain('[Results are filtered by');
+        expect(context).not.toContain('FILTERED BY THIS FIELD');
+        expect(context).not.toContain('User has filtered results by');
+    });
+
+    test('applied hint is still described to the summary as a filter', async () => {
+        const docs = makeDocs([
+            [15, { topic: 'Basics' }],
+            [20, { topic: 'Merging' }],
+        ]);
+        const win = createGuardWindow(
+            { terms: ['merge conflicts', 'conflict markers'], filter_hint: { topic: 'Merging' } },
+            { topic: { Basics: 15, Merging: 20 } },
+            docs
+        );
+
+        await runSearch(win, 'merge conflict resolution');
+
+        expect(win.__getFilterState().llmAppliedFilters).toEqual({ topic: 'Merging' });
+        const context = summarizeContext(win);
+        expect(context).toContain('[Results are filtered by "topic: Merging"]');
+    });
+
+    test('scolta:filters-rendered exposes the applied hint in detail.activeFilters', async () => {
+        const docs = makeDocs([
+            [15, { topic: 'Basics' }],
+            [20, { topic: 'Merging' }],
+        ]);
+        const win = createGuardWindow(
+            { terms: ['merge conflicts', 'conflict markers'], filter_hint: { topic: 'Merging' } },
+            { topic: { Basics: 15, Merging: 20 } },
+            docs
+        );
+        const seen = [];
+        win.document.addEventListener('scolta:filters-rendered', e => seen.push(e.detail.activeFilters));
+
+        await runSearch(win, 'merge conflict resolution');
+
+        expect(seen.length).toBeGreaterThan(0);
+        // A plain object of arrays, not the internal Set map, so a host can
+        // read it without knowing the bundle's representation.
+        expect(seen[seen.length - 1]).toEqual({ topic: ['Merging'] });
+    });
+
+    test('sort path: a subject-matched filter reaches the URL too', async () => {
+        // No filter_hint. The sort hint sends expansion down the native-sort
+        // branch of mergeExpandedSearchResults(), where a subject term that
+        // names a facet value is injected into activeFilters — the second
+        // place a filter lands after doSearch() has already written the URL.
+        const docs = makeDocs([
+            [15, { topic: 'Basics' }],
+            [20, { topic: 'Merging' }],
+        ]);
+        const win = createGuardWindow(
+            {
+                terms: ['merge conflicts'],
+                sort_hint: { field: 'date', direction: 'desc' },
+                subject_terms: ['Merging'],
+            },
+            { topic: { Basics: 15, Merging: 20 } },
+            docs
+        );
+
+        await runSearch(win, 'newest merging guides');
+
+        const state = win.__getFilterState();
+        expect(state.llmAppliedFilters).toEqual({ topic: 'Merging' });
+        expect([...state.activeFilters.topic]).toEqual(['Merging']);
+
+        const url = new win.URL(win.location.href);
+        expect(url.searchParams.get('q')).toBe('newest merging guides');
+        expect(url.searchParams.get('f_topic')).toBe('Merging');
     });
 
     test('stacked hints with healthy marginals but collapsed joint: first applies, second is offered', async () => {

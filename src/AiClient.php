@@ -46,8 +46,9 @@ class AiClient
      * thinking by default, and at the default effort they spend seconds
      * reasoning before a search summary or query expansion that needs none.
      * `low` keeps the response fast. A site can raise it through the `effort`
-     * config key, or send an empty string to omit the field for a model that
-     * predates it.
+     * config key, or send an empty string to never send the field. A model
+     * that predates the field (Sonnet 4.5, Haiku 4.5 and older) never gets
+     * it regardless, see {@see ModelIdentity::acceptsEffort()}.
      *
      * @since 2.0.0
      * @stability experimental
@@ -96,9 +97,11 @@ class AiClient
      *   - timeout: HTTP request timeout in seconds (default: 30)
      *   - effort: Anthropic reasoning effort, one of low|medium|high|xhigh|max
      *     (default: AiClient::DEFAULT_EFFORT). Case and surrounding whitespace
-     *     are ignored. An empty string omits the field; needed for models older
-     *     than Opus 4.5, which reject it. An unrecognised value falls back to
-     *     the default with a warning rather than disabling AI. Ignored by the
+     *     are ignored. Sent only to models that accept the field (Opus 4.5 and
+     *     the 4.6+ and 5.x generations, see ModelIdentity::acceptsEffort());
+     *     older models and unrecognised names get no output_config. An empty
+     *     string never sends it. An unrecognised value falls back to the
+     *     default with a warning rather than disabling AI. Ignored by the
      *     OpenAI path.
      * @param ClientInterface|null $httpClient Optional Guzzle client override.
      * @param LoggerInterface|null $logger PSR-3 logger for config warnings
@@ -327,8 +330,10 @@ class AiClient
         // Current Anthropic models think by default; `low` keeps a summary or
         // expansion from spending seconds reasoning first. No `thinking` block
         // is sent: on the 5.x models thinking is adaptive and cannot be
-        // disabled, and effort is the supported control.
-        if ($this->effort !== '') {
+        // disabled, and effort is the supported control. Models that predate
+        // the field (Sonnet 4.5, Haiku 4.5 and older) reject it with a 400,
+        // so for them the request is sent exactly as before.
+        if ($this->effort !== '' && ModelIdentity::acceptsEffort($model)) {
             $body['output_config'] = ['effort' => $this->effort];
         }
 
@@ -343,7 +348,35 @@ class AiClient
         ]);
 
         $data = json_decode((string) $response->getBody(), true, 512, JSON_THROW_ON_ERROR);
-        return $data['content'][0]['text'] ?? '';
+        return self::anthropicText($data);
+    }
+
+    /**
+     * The answer text of an Anthropic Messages response.
+     *
+     * The response's `content` is a list of typed blocks, and the text is
+     * not always the first one: the Claude 5.x models think adaptively, and
+     * on a long system prompt they put a `thinking` block ahead of the
+     * `text` block (`output_config.effort` lowers how much they think, not
+     * whether). Reading `content[0]['text']` returned '' for such a
+     * response, which turned every query expansion on a 24 KB prompt into
+     * an unexpanded search with nothing logged (sharemylesson.com develop,
+     * 2026-10-19). All text blocks are concatenated, in order, so a reply
+     * split across several is kept whole as well.
+     *
+     * @param mixed $data The decoded response body.
+     */
+    private static function anthropicText(mixed $data): string
+    {
+        $blocks = is_array($data) && is_array($data['content'] ?? null) ? $data['content'] : [];
+        $text = '';
+        foreach ($blocks as $block) {
+            if (is_array($block) && ($block['type'] ?? null) === 'text' && is_string($block['text'] ?? null)) {
+                $text .= $block['text'];
+            }
+        }
+
+        return $text;
     }
 
     private function sendOpenAiRequest(
@@ -370,6 +403,13 @@ class AiClient
         if ($temperature !== null) {
             $body['temperature'] = $temperature;
         }
+        // No effort equivalent is sent here. OpenAI's `reasoning_effort` is
+        // accepted only by its reasoning models (gpt-4o and most compatible
+        // servers answer 400), this path is a generic one whose model names
+        // cannot be classified, and through LiteLLM the field can mean
+        // "enable thinking with a 1024-token budget" on a Claude alias, the
+        // opposite of what `effort` means on the Anthropic path. See the
+        // CHANGELOG entry for `AiClient::DEFAULT_EFFORT`.
 
         $response = $this->httpClient->request('POST', $this->baseUrl, [
             'headers' => [
