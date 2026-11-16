@@ -125,6 +125,19 @@ class AiEndpointHandlerTest extends TestCase
         $this->assertEquals(1, $result['data']['remaining']);
     }
 
+    public function testFollowUpUsesItsOwnTokenCeiling(): void
+    {
+        $messages = [['role' => 'user', 'content' => 'initial question'], ['role' => 'assistant', 'content' => 'reply'], ['role' => 'user', 'content' => 'and parking?']];
+
+        $ai = new MockAiService('answer');
+        $this->makeHandler(aiService: $ai)->handleFollowUp($messages);
+        $this->assertSame(2048, $ai->lastConversationMaxTokens, 'Default leaves room for a model that thinks first');
+
+        $ai = new MockAiService('answer');
+        (new AiEndpointHandler(aiService: $ai, cache: new InMemoryCacheDriver(), generation: 1, cacheTtl: 0, maxFollowUps: 3, aiFollowUpMaxTokens: 700))->handleFollowUp($messages);
+        $this->assertSame(700, $ai->lastConversationMaxTokens);
+    }
+
     public function testFollowUpAcceptsLiteralZeroContent(): void
     {
         // empty('0') is true — the previous empty() check rejected the
@@ -1909,6 +1922,9 @@ class MockAiService
 {
     public int $callCount = 0;
 
+    /** The token ceiling of the last conversation() call. */
+    public ?int $lastConversationMaxTokens = null;
+
     public function __construct(
         private readonly string $response = '',
         private readonly bool $throwOnMessage = false,
@@ -1953,6 +1969,7 @@ class MockAiService
         }
         $this->throwIfConfigured();
         $this->callCount++;
+        $this->lastConversationMaxTokens = $maxTokens;
         return $this->response;
     }
 

@@ -136,6 +136,7 @@ factor before being added to the final score; the title boost is unaffected.
 | `aiSummaryTopN` | int | `10` | Number of top results sent to AI for summarization |
 | `aiSummaryMaxChars` | int | `4000` | Maximum characters of content sent to AI for summarization |
 | `aiSummaryMaxTokens` | int | `1024` | Hard ceiling on tokens the AI may use for a summary response. Sits comfortably above the prompt's natural output length so summaries are never cut off mid-sentence |
+| `aiFollowUpMaxTokens` | int | `2048` | Hard ceiling on tokens the AI may use for one follow-up answer. Was a fixed 512, which cut off or emptied follow-ups on models that think before answering by default, such as Claude Sonnet 5.5 |
 
 ### Multilingual
 
@@ -314,6 +315,7 @@ The full order, the source vocabulary and the rules adapters follow are in
 | `aiSummaryTopN` | `ai_summary_top_n` | `ai_summary_top_n` | `ai_summary_top_n` |
 | `aiSummaryMaxChars` | `ai_summary_max_chars` | `ai_summary_max_chars` | `ai_summary_max_chars` |
 | `aiSummaryMaxTokens` | `ai_summary_max_tokens` | `ai_summary_max_tokens` | `ai_summary_max_tokens` |
+| `aiFollowUpMaxTokens` | `ai_follow_up_max_tokens` | `ai_follow_up_max_tokens` | `ai_follow_up_max_tokens` |
 
 ### Multilingual Keys
 

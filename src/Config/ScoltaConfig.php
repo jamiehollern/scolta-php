@@ -302,6 +302,19 @@ class ScoltaConfig
     public int $aiSummaryMaxChars = 4000;
     public int $aiSummaryMaxTokens = 1024;
 
+    /**
+     * Hard ceiling on tokens the AI may use for one follow-up answer.
+     *
+     * Was a fixed 512. Models that think before answering by default, such as
+     * Claude Sonnet 5.5, spend part of the ceiling on thinking, and at 512 cut
+     * follow-ups off mid-link or returned them empty. Only tokens actually
+     * generated are billed, so a higher ceiling costs nothing on its own.
+     *
+     * @since 2.0.0
+     * @stability experimental
+     */
+    public int $aiFollowUpMaxTokens = 2048;
+
     // -- Multilingual --
     public array $aiLanguages = ['en'];
     public bool $autoLanguageFilter = false;

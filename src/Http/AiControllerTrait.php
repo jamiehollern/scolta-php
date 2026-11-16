@@ -130,6 +130,7 @@ trait AiControllerTrait
             filterFieldDescriptions: $config->filterFieldDescriptions,
             aiModel: $config->aiModel,
             aiExpansionModel: $config->aiExpansionModel,
+            aiFollowUpMaxTokens: $config->aiFollowUpMaxTokens,
         );
     }
 }

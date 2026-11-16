@@ -86,6 +86,7 @@ class AiEndpointHandler
      * @param array<string, string>     $filterFieldDescriptions    Human-readable descriptions for filter fields.
      * @param string                    $aiModel                    Model the summarize call is sent to; part of its cache key.
      * @param string                    $aiExpansionModel           Model the expand call is sent to ('' = $aiModel); part of its cache key.
+     * @param int                       $aiFollowUpMaxTokens        Max tokens for one follow-up answer.
      */
     public function __construct(
         private readonly object $aiService,
@@ -106,6 +107,7 @@ class AiEndpointHandler
         private readonly array $filterFieldDescriptions = [],
         private readonly string $aiModel = '',
         private readonly string $aiExpansionModel = '',
+        private readonly int $aiFollowUpMaxTokens = 2048,
     ) {}
 
     /**
@@ -397,7 +399,7 @@ class AiEndpointHandler
             $response = $this->aiService->conversation(
                 $systemPrompt,
                 $messages,
-                512,
+                $this->aiFollowUpMaxTokens,
             );
 
             $remaining = $this->maxFollowUps - $followUpsSoFar - 1;
