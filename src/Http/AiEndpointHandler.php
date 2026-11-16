@@ -107,7 +107,7 @@ class AiEndpointHandler
         private readonly array $filterFieldDescriptions = [],
         private readonly string $aiModel = '',
         private readonly string $aiExpansionModel = '',
-        private readonly int $aiFollowUpMaxTokens = 2048,
+        private readonly int $aiFollowUpMaxTokens = 512,
     ) {}
 
     /**

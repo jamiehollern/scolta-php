@@ -50,7 +50,7 @@ class ScoltaConfigTest extends TestCase
         $this->assertEquals(10, $config->aiSummaryTopN);
         $this->assertEquals(4000, $config->aiSummaryMaxChars);
         $this->assertSame(1024, $config->aiSummaryMaxTokens);
-        $this->assertSame(2048, $config->aiFollowUpMaxTokens);
+        $this->assertSame(512, $config->aiFollowUpMaxTokens);
         $this->assertFalse($config->autoLanguageFilter);
         $this->assertTrue($config->hideEmptyFacets);
         $this->assertEquals('', $config->promptExpandQuery);

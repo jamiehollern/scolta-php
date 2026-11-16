@@ -131,11 +131,11 @@ class AiEndpointHandlerTest extends TestCase
 
         $ai = new MockAiService('answer');
         $this->makeHandler(aiService: $ai)->handleFollowUp($messages);
-        $this->assertSame(2048, $ai->lastConversationMaxTokens, 'Default leaves room for a model that thinks first');
+        $this->assertSame(512, $ai->lastConversationMaxTokens, 'Default is the former hard-coded ceiling');
 
         $ai = new MockAiService('answer');
-        (new AiEndpointHandler(aiService: $ai, cache: new InMemoryCacheDriver(), generation: 1, cacheTtl: 0, maxFollowUps: 3, aiFollowUpMaxTokens: 700))->handleFollowUp($messages);
-        $this->assertSame(700, $ai->lastConversationMaxTokens);
+        (new AiEndpointHandler(aiService: $ai, cache: new InMemoryCacheDriver(), generation: 1, cacheTtl: 0, maxFollowUps: 3, aiFollowUpMaxTokens: 2048))->handleFollowUp($messages);
+        $this->assertSame(2048, $ai->lastConversationMaxTokens);
     }
 
     public function testFollowUpAcceptsLiteralZeroContent(): void
